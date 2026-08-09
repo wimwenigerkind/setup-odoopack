@@ -1,0 +1,135 @@
+name: 'Setup odoopack'
+description: 'Install the odoopack CLI and optionally configure private registry authentication.'
+author: 'Wim Wenigerkind'
+branding:
+  icon: 'package'
+  color: 'purple'
+
+inputs:
+  version:
+    description: 'odoopack release to install: a tag like "1.2.0" / "v1.2.0", or "latest".'
+    required: false
+    default: 'latest'
+  token:
+    description: 'API token for a private odoopack registry. When set, registry-url is required.'
+    required: false
+    default: ''
+  registry-url:
+    description: 'Base URL of the registry the token authenticates against (e.g. https://registry.example.com).'
+    required: false
+    default: ''
+
+outputs:
+  version:
+    description: 'The release tag that was installed.'
+    value: ${{ steps.install.outputs.version }}
+  odoopack-path:
+    description: 'Absolute path to the installed odoopack binary.'
+    value: ${{ steps.install.outputs.odoopack-path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        REPO="wimwenigerkind/odoopack"
+        version="${INPUT_VERSION:-latest}"
+
+        case "$RUNNER_OS" in
+          Linux) os="Linux" ;;
+          macOS) os="Darwin" ;;
+          Windows) os="Windows" ;;
+          *) echo "::error::unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64) arch="x86_64" ;;
+          ARM64) arch="arm64" ;;
+          X86) arch="i386" ;;
+          *) echo "::error::unsupported runner arch: $RUNNER_ARCH"; exit 1 ;;
+        esac
+        if [ "$RUNNER_OS" = "Windows" ]; then ext="zip"; bin="odoopack.exe"; else ext="tar.gz"; bin="odoopack"; fi
+        asset="odoopack_${os}_${arch}.${ext}"
+
+        if [ "$version" = "latest" ]; then
+          loc=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")
+          candidates="${loc##*/}"
+          if [ "$candidates" = "releases" ] || [ "$candidates" = "latest" ]; then
+            echo "::error::no releases found for ${REPO}"; exit 1
+          fi
+        else
+          case "$version" in
+            v*) candidates="$version ${version#v}" ;;
+            *)  candidates="$version v$version" ;;
+          esac
+        fi
+
+        dl="$(mktemp -d)"
+        tag=""
+        for c in $candidates; do
+          base="https://github.com/${REPO}/releases/download/${c}"
+          if curl -fsSL -o "${dl}/${asset}" "${base}/${asset}"; then tag="$c"; break; fi
+        done
+        if [ -z "$tag" ]; then
+          echo "::error::could not download ${asset} for version '${version}' from ${REPO}"; exit 1
+        fi
+        base="https://github.com/${REPO}/releases/download/${tag}"
+
+        checksums="odoopack_${tag#v}_checksums.txt"
+        if curl -fsSL -o "${dl}/checksums.txt" "${base}/${checksums}"; then
+          if command -v sha256sum >/dev/null 2>&1; then sumcmd="sha256sum"; else sumcmd="shasum -a 256"; fi
+          expected=$(grep " ${asset}\$" "${dl}/checksums.txt" | awk '{print $1}' | head -n1)
+          if [ -n "$expected" ]; then
+            actual=$($sumcmd "${dl}/${asset}" | awk '{print $1}')
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::checksum mismatch for ${asset} (expected ${expected}, got ${actual})"; exit 1
+            fi
+            echo "checksum verified for ${asset}"
+          fi
+        else
+          echo "::warning::${checksums} not found for ${tag}; skipping verification"
+        fi
+
+        install_dir="${RUNNER_TEMP}/odoopack-cli"
+        mkdir -p "$install_dir"
+        case "$ext" in
+          tar.gz) tar -xzf "${dl}/${asset}" -C "$install_dir" ;;
+          zip) unzip -o "${dl}/${asset}" -d "$install_dir" >/dev/null ;;
+        esac
+        if [ ! -f "${install_dir}/${bin}" ]; then
+          echo "::error::binary ${bin} not found in archive ${asset}"; exit 1
+        fi
+        chmod +x "${install_dir}/${bin}" 2>/dev/null || true
+
+        echo "$install_dir" >> "$GITHUB_PATH"
+        echo "version=${tag}" >> "$GITHUB_OUTPUT"
+        echo "odoopack-path=${install_dir}/${bin}" >> "$GITHUB_OUTPUT"
+        echo "installed odoopack ${tag} to ${install_dir}/${bin}"
+
+    - id: auth
+      if: inputs.token != ''
+      shell: bash
+      env:
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_REGISTRY_URL: ${{ inputs.registry-url }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${INPUT_TOKEN}"
+        if [ -z "${INPUT_REGISTRY_URL}" ]; then
+          echo "::error::token was provided but registry-url is empty — set registry-url so the token can be scoped to that host"
+          exit 1
+        fi
+        url="${INPUT_REGISTRY_URL}"
+        scheme="${url%%://*}"
+        rest="${url#*://}"
+        host="${rest%%/*}"
+        if [ "$scheme" = "$url" ]; then
+          scheme="https"
+          host="${url%%/*}"
+        fi
+        auth="{\"bearer\":{\"${host}\":\"${INPUT_TOKEN}\",\"${scheme}://${host}\":\"${INPUT_TOKEN}\"}}"
+        echo "ODOOPACK_AUTH=${auth}" >> "$GITHUB_ENV"
+        echo "configured ODOOPACK_AUTH for ${scheme}://${host}"
