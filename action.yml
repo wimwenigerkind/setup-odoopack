@@ -7,7 +7,7 @@ branding:
 
 inputs:
   version:
-    description: 'odoopack release to install: a tag like "1.2.0" / "v1.2.0", or "latest".'
+    description: 'odoopack release to install: a tag like "0.1.0" or "v0.1.0", or "latest".'
     required: false
     default: 'latest'
   token:
@@ -79,19 +79,20 @@ runs:
         base="https://github.com/${REPO}/releases/download/${tag}"
 
         checksums="odoopack_${tag#v}_checksums.txt"
-        if curl -fsSL -o "${dl}/checksums.txt" "${base}/${checksums}"; then
-          if command -v sha256sum >/dev/null 2>&1; then sumcmd="sha256sum"; else sumcmd="shasum -a 256"; fi
-          expected=$(grep " ${asset}\$" "${dl}/checksums.txt" | awk '{print $1}' | head -n1)
-          if [ -n "$expected" ]; then
-            actual=$($sumcmd "${dl}/${asset}" | awk '{print $1}')
-            if [ "$expected" != "$actual" ]; then
-              echo "::error::checksum mismatch for ${asset} (expected ${expected}, got ${actual})"; exit 1
-            fi
-            echo "checksum verified for ${asset}"
-          fi
-        else
-          echo "::warning::${checksums} not found for ${tag}; skipping verification"
+        if ! curl -fsSL -o "${dl}/checksums.txt" "${base}/${checksums}"; then
+          echo "::error::could not download ${checksums} for ${tag}; refusing to install an unverified binary"; exit 1
         fi
+        # awk instead of grep: grep exits 1 when nothing matches, which ends the step silently under pipefail.
+        expected=$(awk -v a="$asset" '$2 == a { print $1; exit }' "${dl}/checksums.txt")
+        if [ -z "$expected" ]; then
+          echo "::error::${checksums} has no entry for ${asset}; refusing to install an unverified binary"; exit 1
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then sumcmd="sha256sum"; else sumcmd="shasum -a 256"; fi
+        actual=$($sumcmd "${dl}/${asset}" | awk '{print $1}')
+        if [ "$expected" != "$actual" ]; then
+          echo "::error::checksum mismatch for ${asset} (expected ${expected}, got ${actual})"; exit 1
+        fi
+        echo "checksum verified for ${asset}"
 
         install_dir="${RUNNER_TEMP}/odoopack-cli"
         mkdir -p "$install_dir"
@@ -117,9 +118,14 @@ runs:
         INPUT_REGISTRY_URL: ${{ inputs.registry-url }}
       run: |
         set -euo pipefail
+        # Checked before add-mask: a mask only covers a single line, so a multi-line token would leak into the log.
+        case "${INPUT_TOKEN}${INPUT_REGISTRY_URL}" in
+          *$'\n'* | *$'\r'*)
+            echo "::error::token and registry-url must not contain a newline or carriage return"; exit 1 ;;
+        esac
         echo "::add-mask::${INPUT_TOKEN}"
         if [ -z "${INPUT_REGISTRY_URL}" ]; then
-          echo "::error::token was provided but registry-url is empty — set registry-url so the token can be scoped to that host"
+          echo "::error::token was provided but registry-url is empty: set registry-url so the token can be scoped to that host"
           exit 1
         fi
         url="${INPUT_REGISTRY_URL}"
@@ -130,6 +136,28 @@ runs:
           scheme="https"
           host="${url%%/*}"
         fi
-        auth="{\"bearer\":{\"${host}\":\"${INPUT_TOKEN}\",\"${scheme}://${host}\":\"${INPUT_TOKEN}\"}}"
-        echo "ODOOPACK_AUTH=${auth}" >> "$GITHUB_ENV"
+        if [ -z "$host" ]; then
+          echo "::error::registry-url '${url}' has no host"; exit 1
+        fi
+        # Mirrors the CLI, which sends a token over plain http only to a loopback host.
+        hostname="${host%:*}"
+        case "$host" in \[*) hostname="${host%%]*}]" ;; esac
+        case "$scheme" in
+          https) ;;
+          http)
+            case "$hostname" in
+              localhost | 127.* | "[::1]") ;;
+              *) echo "::error::registry-url '${url}' uses http; odoopack sends a token only over https (plain http is allowed for localhost only)"; exit 1 ;;
+            esac ;;
+          *) echo "::error::registry-url '${url}' must use https"; exit 1 ;;
+        esac
+        auth=$(jq -cn --arg host "$host" --arg url "${scheme}://${host}" --arg token "$INPUT_TOKEN" \
+          '{bearer: {($host): $token, ($url): $token}}')
+        # Strip a carriage return in case jq on Windows writes CRLF line endings.
+        auth="${auth%$'\r'}"
+        {
+          echo "ODOOPACK_AUTH<<ODOOPACK_AUTH_EOF"
+          echo "$auth"
+          echo "ODOOPACK_AUTH_EOF"
+        } >> "$GITHUB_ENV"
         echo "configured ODOOPACK_AUTH for ${scheme}://${host}"

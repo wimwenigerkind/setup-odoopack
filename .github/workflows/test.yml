@@ -1,0 +1,91 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: setup
+        uses: ./
+        with:
+          version: latest
+      - name: odoopack is on the PATH and reports the installed version
+        env:
+          TAG: ${{ steps.setup.outputs.version }}
+          BIN: ${{ steps.setup.outputs.odoopack-path }}
+        run: |
+          set -euo pipefail
+          test -n "$TAG"
+          test -f "$BIN"
+          out=$(odoopack --version)
+          echo "$out"
+          case "$out" in
+            *"${TAG#v}"*) ;;
+            *) echo "::error::expected version ${TAG#v} in '$out'"; exit 1 ;;
+          esac
+
+  auth:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # A quote and a backslash would have broken the JSON built by string concatenation.
+      - uses: ./
+        with:
+          registry-url: https://registry.example.com/
+          token: 'fake"to\ken'
+      - name: ODOOPACK_AUTH holds the token for the bare host and for scheme://host
+        run: |
+          set -euo pipefail
+          jq -e --arg t 'fake"to\ken' '
+            keys == ["bearer"]
+            and (.bearer | length) == 2
+            and .bearer["registry.example.com"] == $t
+            and .bearer["https://registry.example.com"] == $t
+          ' <<<"$ODOOPACK_AUTH"
+
+  auth-rejects:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: newline
+        continue-on-error: true
+        uses: ./
+        with:
+          registry-url: https://registry.example.com
+          token: "fake\ntoken"
+      - id: plain-http
+        continue-on-error: true
+        uses: ./
+        with:
+          registry-url: http://registry.example.com
+          token: faketoken
+      - name: both were refused and nothing was exported
+        env:
+          NEWLINE: ${{ steps.newline.outcome }}
+          PLAIN_HTTP: ${{ steps.plain-http.outcome }}
+        run: |
+          set -euo pipefail
+          test "$NEWLINE" = failure
+          test "$PLAIN_HTTP" = failure
+          test -z "${ODOOPACK_AUTH:-}"
