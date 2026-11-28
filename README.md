@@ -36,6 +36,27 @@ Provide a registry API token (created under *Profile → Tokens* in the registry
 - run: odoopack install
 ```
 
+### Workload identity
+
+Instead of storing a token, the job can exchange its own OIDC token for a registry token of a service account. An admin configures the CI as a workload identity provider in the registry and binds the repository to a service account (subject `repo:acme/odoo:*`, for example). The action requests the OIDC token with `registry-url` as its audience and exports the exchanged token as `ODOOPACK_AUTH`. That token is valid for 15 minutes, so run `odoopack` in the same job right after.
+
+On GitHub Actions the job needs `id-token: write`:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+steps:
+  - uses: wimwenigerkind/setup-odoopack@v0
+    with:
+      registry-url: https://registry.example.com
+      workload-identity-provider: github
+      service-account: acme-ci
+  - run: odoopack install
+```
+
+On Forgejo Actions set `enable-openid-connect: true` on the job instead.
+
 ## Inputs
 
 | Input | Default | Description |
@@ -43,6 +64,8 @@ Provide a registry API token (created under *Profile → Tokens* in the registry
 | `version` | `latest` | odoopack release to install (`0.1.0`, `v0.1.0`, or `latest`). |
 | `token` | `''` | API token for a private registry. Requires `registry-url`. |
 | `registry-url` | `''` | Base URL the token authenticates against, e.g. `https://registry.example.com`. |
+| `workload-identity-provider` | `''` | Provider name configured in the registry. With `service-account`, replaces `token`. |
+| `service-account` | `''` | Service account bound to the job through that provider. |
 
 ## Outputs
 

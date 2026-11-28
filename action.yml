@@ -18,6 +18,14 @@ inputs:
     description: 'Base URL of the registry the token authenticates against (e.g. https://registry.example.com).'
     required: false
     default: ''
+  workload-identity-provider:
+    description: 'Name of a workload identity provider configured in the registry. With service-account, exchanges the job''s OIDC token for a short-lived registry token instead of using token.'
+    required: false
+    default: ''
+  service-account:
+    description: 'Name of the registry service account bound to the job through workload-identity-provider.'
+    required: false
+    default: ''
 
 outputs:
   version:
@@ -111,21 +119,30 @@ runs:
         echo "installed odoopack ${tag} to ${install_dir}/${bin}"
 
     - id: auth
-      if: inputs.token != ''
+      if: inputs.token != '' || inputs.workload-identity-provider != '' || inputs.service-account != ''
       shell: bash
       env:
         INPUT_TOKEN: ${{ inputs.token }}
         INPUT_REGISTRY_URL: ${{ inputs.registry-url }}
+        INPUT_PROVIDER: ${{ inputs.workload-identity-provider }}
+        INPUT_SERVICE_ACCOUNT: ${{ inputs.service-account }}
       run: |
         set -euo pipefail
         # Checked before add-mask: a mask only covers a single line, so a multi-line token would leak into the log.
-        case "${INPUT_TOKEN}${INPUT_REGISTRY_URL}" in
+        case "${INPUT_TOKEN}${INPUT_REGISTRY_URL}${INPUT_PROVIDER}${INPUT_SERVICE_ACCOUNT}" in
           *$'\n'* | *$'\r'*)
-            echo "::error::token and registry-url must not contain a newline or carriage return"; exit 1 ;;
+            echo "::error::token, registry-url, workload-identity-provider and service-account must not contain a newline or carriage return"; exit 1 ;;
         esac
-        echo "::add-mask::${INPUT_TOKEN}"
+        if [ -n "${INPUT_TOKEN}" ]; then
+          echo "::add-mask::${INPUT_TOKEN}"
+          if [ -n "${INPUT_PROVIDER}${INPUT_SERVICE_ACCOUNT}" ]; then
+            echo "::error::set either token or workload-identity-provider and service-account, not both"; exit 1
+          fi
+        elif [ -z "${INPUT_PROVIDER}" ] || [ -z "${INPUT_SERVICE_ACCOUNT}" ]; then
+          echo "::error::workload identity needs both workload-identity-provider and service-account"; exit 1
+        fi
         if [ -z "${INPUT_REGISTRY_URL}" ]; then
-          echo "::error::token was provided but registry-url is empty: set registry-url so the token can be scoped to that host"
+          echo "::error::registry-url is empty: set it so the token can be scoped to that host"
           exit 1
         fi
         url="${INPUT_REGISTRY_URL}"
@@ -151,6 +168,44 @@ runs:
             esac ;;
           *) echo "::error::registry-url '${url}' must use https"; exit 1 ;;
         esac
+
+        if [ -z "${INPUT_TOKEN}" ]; then
+          # GitHub sets these with permissions id-token: write, Forgejo with enable-openid-connect: true.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::no OIDC token available: grant 'permissions: id-token: write' on GitHub or set 'enable-openid-connect: true' on the Forgejo job"
+            exit 1
+          fi
+          # The registry expects its base URL without a trailing slash as the audience.
+          base="${scheme}://${rest%/}"
+          if ! response=$(curl -sS --fail-with-body -G \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            --data-urlencode "audience=${base}" "${ACTIONS_ID_TOKEN_REQUEST_URL}"); then
+            echo "::error::requesting the OIDC token of the job failed: ${response}"; exit 1
+          fi
+          id_token=$(jq -r '.value // empty' <<<"$response")
+          id_token="${id_token%$'\r'}"
+          if [ -z "$id_token" ]; then
+            echo "::error::the CI returned no OIDC token"; exit 1
+          fi
+          echo "::add-mask::${id_token}"
+          if ! response=$(curl -sS --fail-with-body -X POST "${base}/oauth/token" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            --data-urlencode "subject_token=${id_token}" \
+            --data-urlencode "workload_identity_provider=${INPUT_PROVIDER}" \
+            --data-urlencode "service_account=${INPUT_SERVICE_ACCOUNT}"); then
+            echo "::error::the registry refused the token exchange for service account '${INPUT_SERVICE_ACCOUNT}' (${response}); its log names the reason"
+            exit 1
+          fi
+          INPUT_TOKEN=$(jq -r '.access_token // empty' <<<"$response")
+          INPUT_TOKEN="${INPUT_TOKEN%$'\r'}"
+          if [ -z "$INPUT_TOKEN" ]; then
+            echo "::error::the registry returned no access token"; exit 1
+          fi
+          echo "::add-mask::${INPUT_TOKEN}"
+          echo "exchanged the OIDC token of the job for a registry token of '${INPUT_SERVICE_ACCOUNT}', valid $(jq -r '.expires_in' <<<"$response")s"
+        fi
+
         auth=$(jq -cn --arg host "$host" --arg url "${scheme}://${host}" --arg token "$INPUT_TOKEN" \
           '{bearer: {($host): $token, ($url): $token}}')
         # Strip a carriage return in case jq on Windows writes CRLF line endings.
